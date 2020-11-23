@@ -13,6 +13,8 @@ import sys
 import ast
 from threading import Thread
 from pathlib import Path
+import requests
+import configparser
 
 from mapadroid.utils.madGlobals import WebsocketWorkerRemovedException, \
         WebsocketWorkerTimeoutException, WebsocketWorkerConnectionClosedException, \
@@ -84,12 +86,64 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
         # do not change this part △△△△△△△△△△△△△△△
 
         # load your stuff now
-        self.logger.success("activityFile Plugin starting operations ...")
-        activityFile = Thread(name="activityFile", target=self.activityFile,)
+        self.logger.success("{} Plugin starting operations ...", self.pluginname)
+        activityFile = Thread(name=self.pluginname, target=self.activityFile,)
         activityFile.daemon = True
         activityFile.start()
 
+        updateChecker = Thread(name="{}Updates".format(self.pluginname), target=self.update_checker,)
+        updateChecker.daemon = True
+        updateChecker.start()
+
         return True
+
+    def _is_update_available(self):
+        update_available = None
+        try:
+            raw_url = self.url.replace("github.com", "raw.githubusercontent.com")
+            r = requests.get("{}/main/version.mpl".format(raw_url))
+            self.github_mpl = configparser.ConfigParser()
+            self.github_mpl.read_string(r.text)
+            self.available_version = self.github_mpl.get("plugin", "version", fallback=self.version)
+        except Exception as e:
+            return None
+
+        try:
+            from pkg_resources import parse_version
+            update_available = parse_version(self.version) < parse_version(self.available_version)
+        except Exception:
+            pass
+
+        if update_available is None:
+            try:
+                from distutils.version import LooseVersion
+                update_available = LooseVersion(self.version) < LooseVersion(self.available_version)
+            except Exception:
+                pass
+
+        if update_available is None:
+            try:
+                from packaging import version
+                update_available = version.parse(self.version) < version.parse(self.available_version)
+            except Exception:
+                pass
+
+        return update_available
+
+
+    def update_checker(self):
+        while True:
+            self.logger.debug("{} checking for updates ...", self.pluginname)
+            result = self._is_update_available()
+            if result:
+                self.logger.warning("An update of {} from version {} to version {} is available!",
+                                    self.pluginname, self.version, self.available_version)
+            elif result is False:
+                self.logger.success("{} is up-to-date! ({} = {})", self.pluginname, self.version,
+                                    self.available_version)
+            else:
+                self.logger.warning("Failed checking for updates!")
+            time.sleep(3600)
 
 
     def activityFile(self):
