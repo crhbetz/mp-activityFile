@@ -1,0 +1,6 @@
+[plugin]
+active = true
+
+[settings]
+interval = 60
+successlog = true
