@@ -32,7 +32,7 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
         self._mad = mad
         self.logger = self._mad['logger']
         self.db = self._mad["db_wrapper"]
-        
+
         self.statusname = self._mad["args"].status_name
         self._pluginconfig.read(self._rootdir + "/plugin.ini")
         self._versionconfig.read(self._rootdir + "/version.mpl")
@@ -52,8 +52,12 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
             self.logger.info("Using generic settings on instance with status-name {}", self.statusname)
             settings = "settings"
 
-        self.interval = self._pluginconfig.getint(settings, "interval", fallback=60)
+        # backwards compatability of activity interval setting ...
+        self.activity_interval = self._pluginconfig.getint(settings, "activityinterval",
+                fallback=self._pluginconfig.getint(settings, "interval", fallback=60))
+        self.ip_interval = self._pluginconfig.getint(settings, "ipinterval", fallback=1800)
         self.successlog = self._pluginconfig.getboolean(settings, "successlog", fallback=True)
+        self.iplog = self._pluginconfig.getboolean(settings, "iplog", fallback=False)
         self.ws_server = self._mad['ws_server']
         self.args = self._mad['args']
 
@@ -86,10 +90,15 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
         # do not change this part △△△△△△△△△△△△△△△
 
         # load your stuff now
-        self.logger.success("{} Plugin starting operations ...", self.pluginname)
-        activityFile = Thread(name=self.pluginname, target=self.activityFile,)
-        activityFile.daemon = True
-        activityFile.start()
+        if not self.activity_interval == 0:
+            activityFile = Thread(name=self.pluginname, target=self.activityFile,)
+            activityFile.daemon = True
+            activityFile.start()
+
+        if not self.ip_interval == 0:
+            saveIps = Thread(name="{}SaveIps".format(self.pluginname), target=self.saveIps,)
+            saveIps.daemon = True
+            saveIps.start()
 
         updateChecker = Thread(name="{}Updates".format(self.pluginname), target=self.update_checker,)
         updateChecker.daemon = True
@@ -146,22 +155,63 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
             time.sleep(3600)
 
 
+    def send_command(self, device, command, timeout=30):
+        try:
+            communicator = self.ws_server.get_origin_communicator(device)
+            self.logger.debug("communicator: {}".format(communicator))
+            result = communicator.websocket_client_entry \
+                    .send_and_wait(command, timeout=timeout,
+                            worker_instance=communicator.worker_instance_ref)
+            return result
+        except Exception as e:
+            self.logger.warning("Sending command to {} failed with exception: {} "
+                "(repr: {}) - ignore ...", device, e, repr(e))
+            return None
+
+
     def activityFile(self):
+        self.logger.success("starting activityFile thread")
         while True:
             devices = self.ws_server.get_reg_origins()
             loglist = []
             for device in devices:
-                # touch file
-                Path(os.path.join(self.args.file_path, str(device) + '.active')).touch()
-                # details for logging
                 communicator = self.ws_server.get_origin_communicator(device)
                 entry = communicator.websocket_client_entry
-                timestamp = entry.last_message_received_at
-                loglist.append((device, datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')))
+                timestamp = int(entry.last_message_received_at)
+                # touch file
+                if timestamp > 10000:
+                    path = os.path.join(self.args.file_path, str(device) + '.active')
+                    tsTuple = (timestamp, timestamp)
+                    try:
+                        os.utime(path, tsTuple)
+                    except FileNotFoundError:
+                        self.logger.warning(f"FileNotFound Error for {path} - try Pathlib touch")
+                        Path(path).touch()
+                    loglist.append((device, datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')))
             if self.successlog:
                 loglist = sorted(loglist, key=lambda x: x[1], reverse=True)
                 self.logger.success("touched {} devices: {}", len(loglist), loglist)
-            time.sleep(self.interval)
+            time.sleep(self.activity_interval)
+
+
+    def saveIps(self):
+        self.logger.success("starting saveIps thread - wait 1 minute for devices to connect")
+        time.sleep(60)
+        while True:
+            devices = self.ws_server.get_reg_origins()
+            loglist = []
+            for device in devices:
+                ipcommand = "passthrough echo \"$(ifconfig | awk '/inet addr/{print substr($2,6)}' | grep -v '127.0.0.1'),$(curl -k -s https://ifconfig.me)\""
+                ips = self.send_command(device, ipcommand)
+                if ips:
+                    ips = ips.replace("[", "").replace("]", "")
+                    if self.iplog:
+                        self.logger.success(f"{device} got IPs: {ips}")
+                    path = os.path.join(self.args.file_path, str(device) + '.ips')
+                    with open(path, "w") as f:
+                        f.write(f"{ips}")
+            self.logger.debug(f"saveIps function sleep {self.ip_interval}")
+            time.sleep(self.ip_interval)
 
 
     @auth_required
