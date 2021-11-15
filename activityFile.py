@@ -1,6 +1,4 @@
-import mapadroid.utils.pluginBase
-from flask import render_template, Blueprint
-from mapadroid.madmin.functions import auth_required
+import mapadroid.plugins.pluginBase
 import os
 import time
 from datetime import datetime
@@ -11,25 +9,32 @@ import select
 import json
 import sys
 import ast
-from threading import Thread
 from pathlib import Path
 import requests
 import configparser
+import asyncio
+from aiohttp import web
+from typing import Dict
 
+from plugins.activityFile.endoints import register_custom_plugin_endpoints
 from mapadroid.utils.madGlobals import WebsocketWorkerRemovedException, \
         WebsocketWorkerTimeoutException, WebsocketWorkerConnectionClosedException, \
         InternalStopWorkerException
 
 
-class activityFile(mapadroid.utils.pluginBase.Plugin):
+class activityFile(mapadroid.plugins.pluginBase.Plugin):
     """activityFile plugin
     """
-    def __init__(self, mad):
-        super().__init__(mad)
+
+    def _file_path(self) -> str:
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def __init__(self, subapp_to_register_to: web.Application, mad_parts: Dict):
+        super().__init__(subapp_to_register_to, mad_parts)
 
         self._rootdir = os.path.dirname(os.path.abspath(__file__))
 
-        self._mad = mad
+        self._mad = self._mad_parts
         self.logger = self._mad['logger']
         self.db = self._mad["db_wrapper"]
 
@@ -61,48 +66,34 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
         self.ws_server = self._mad['ws_server']
         self.args = self._mad['args']
 
-
-        self._routes = [
-            ("/activityFile_manual", self.manual),
-        ]
-
         self._hotlink = [
             ("activityFile Manual", "activityFile_manual", "activityFile Manual"),
         ]
 
         if self._pluginconfig.getboolean("plugin", "active", fallback=False):
-            self._plugin = Blueprint(str(self.pluginname), __name__, static_folder=self.staticpath,
-                                     template_folder=self.templatepath)
-
-            for route, view_func in self._routes:
-                self._plugin.add_url_rule(route, route.replace("/", ""), view_func=view_func)
+            register_custom_plugin_endpoints(self._plugin_subapp)
 
             for name, link, description in self._hotlink:
-                self._mad['madmin'].add_plugin_hotlink(name, self._plugin.name+"."+link.replace("/", ""),
+                self._mad_parts['madmin'].add_plugin_hotlink(name, link.replace("/", ""),
                                                        self.pluginname, self.description, self.author, self.url,
                                                        description, self.version)
 
-    def perform_operation(self):
-        # do not change this part ▽▽▽▽▽▽▽▽▽▽▽▽▽▽▽
+
+    async def _perform_operation(self):
         if not self._pluginconfig.getboolean("plugin", "active", fallback=False):
             return False
-        self._mad['madmin'].register_plugin(self._plugin)
-        # do not change this part △△△△△△△△△△△△△△△
 
         # load your stuff now
         if not self.activity_interval == 0:
-            activityFile = Thread(name=self.pluginname, target=self.activityFile,)
-            activityFile.daemon = True
-            activityFile.start()
+            loop = asyncio.get_event_loop()
+            loop.create_task(self.activityFile())
 
         if not self.ip_interval == 0:
-            saveIps = Thread(name="{}SaveIps".format(self.pluginname), target=self.saveIps,)
-            saveIps.daemon = True
-            saveIps.start()
+            loop = asyncio.get_event_loop()
+            loop.create_task(self.saveIps())
 
-        updateChecker = Thread(name="{}Updates".format(self.pluginname), target=self.update_checker,)
-        updateChecker.daemon = True
-        updateChecker.start()
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.update_checker())
 
         return True
 
@@ -140,7 +131,7 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
         return update_available
 
 
-    def update_checker(self):
+    async def update_checker(self):
         while True:
             self.logger.debug("{} checking for updates ...", self.pluginname)
             result = self._is_update_available()
@@ -152,27 +143,26 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
                                     self.available_version)
             else:
                 self.logger.warning("Failed checking for updates!")
-            time.sleep(3600)
+            await asyncio.sleep(3600)
 
 
-    def send_command(self, device, command, timeout=30):
+    async def send_command(self, device, command, timeout=10):
         try:
             communicator = self.ws_server.get_origin_communicator(device)
             self.logger.debug("communicator: {}".format(communicator))
-            result = communicator.websocket_client_entry \
-                    .send_and_wait(command, timeout=timeout,
-                            worker_instance=communicator.worker_instance_ref)
+            result = await communicator._Communicator__run_get_gesponse(command, timeout=timeout)
             return result
         except Exception as e:
             self.logger.warning("Sending command to {} failed with exception: {} "
-                "(repr: {}) - ignore ...", device, e, repr(e))
+                "(repr: {}) - try to gracefully stop worker!", device, e, repr(e))
             return None
 
 
-    def activityFile(self):
+    async def activityFile(self):
         self.logger.success("starting activityFile thread")
+        comparedict = {}
         while True:
-            devices = self.ws_server.get_reg_origins()
+            devices = await self.ws_server.get_reg_origins()
             loglist = []
             for device in devices:
                 communicator = self.ws_server.get_origin_communicator(device)
@@ -180,6 +170,9 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
                 timestamp = int(entry.last_message_received_at)
                 # touch file
                 if timestamp > 10000:
+                    if device in comparedict and timestamp - comparedict[device] > 90:
+                        self.logger.success("{} recovered after {} seconds!",
+                                            device, timestamp - comparedict[device])
                     path = os.path.join(self.args.file_path, str(device) + '.active')
                     tsTuple = (timestamp, timestamp)
                     try:
@@ -188,21 +181,24 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
                         self.logger.warning(f"FileNotFound Error for {path} - try Pathlib touch")
                         Path(path).touch()
                     loglist.append((device, datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')))
+                    comparedict[device] = timestamp
             if self.successlog:
                 loglist = sorted(loglist, key=lambda x: x[1], reverse=True)
                 self.logger.success("touched {} devices: {}", len(loglist), loglist)
-            time.sleep(self.activity_interval)
+                self.logger.success("Info on {} devices total: {}", len(comparedict), comparedict)
+            await asyncio.sleep(self.activity_interval)
 
 
-    def saveIps(self):
+    async def saveIps(self):
         self.logger.success("starting saveIps thread - wait 1 minute for devices to connect")
-        time.sleep(60)
+        await asyncio.sleep(60)
         while True:
-            devices = self.ws_server.get_reg_origins()
+            devices = await self.ws_server.get_reg_origins()
             loglist = []
             for device in devices:
-                ipcommand = "passthrough echo \"$(ifconfig | awk '/inet addr/{print substr($2,6)}' | grep -v '127.0.0.1'),$(curl -k -s https://ifconfig.me)\""
-                ips = self.send_command(device, ipcommand)
+                ipcommand = ("passthrough echo \"$(ifconfig | awk '/inet addr/{print substr($2,6)}' "
+                            "| grep -v '127.0.0.1'),$(curl -k -s https://ifconfig.me)\"")
+                ips = await self.send_command(device, ipcommand)
                 if ips:
                     ips = ips.replace("[", "").replace("]", "")
                     if self.iplog:
@@ -211,12 +207,4 @@ class activityFile(mapadroid.utils.pluginBase.Plugin):
                     with open(path, "w") as f:
                         f.write(f"{ips}")
             self.logger.debug(f"saveIps function sleep {self.ip_interval}")
-            time.sleep(self.ip_interval)
-
-
-    @auth_required
-    def manual(self):
-        return render_template("activityFile_manual.html",
-                               header="activityFile manual", title="activityFile manual"
-                               )
-
+            await asyncio.sleep(self.ip_interval)

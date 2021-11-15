@@ -1,6 +1,10 @@
 # mp-activityFile
 MAD plugin to touch a `.active` file when there is an active connection to RGC on a device and/or write device IPs to a `.ips` file.
 
+# Attention - 3.0 breaking change (MAD scalability / asyncio)
+
+Version 3.0+ of this plugin has been reworked to operate on the MAD scalability update (currently as of Nov. 2021 on MAD branch `redis_mitm_mapper`), which relies on asyncio. I have no plans for backwards compatability.
+
 ### Description
 This very simple plugin will touch a file called `$origin.active` in the folder you configured as files-folder in MAD (default: `files/` inside your MAD folder) for every device that currently has RGC connected to MAD.
 Thus, you can identify a devices RGC connection status by looking at the last-modified time of the corresponding `.active` file.
