@@ -4,3 +4,5 @@ active = true
 [settings]
 interval = 60
 successlog = true
+ipinterval = 1800
+iplog = False
